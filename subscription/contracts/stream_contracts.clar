@@ -1,5 +1,5 @@
-;; SubscriptionNexus - Basic Service Payment Streams Contract v1.0
-;; Initial implementation with core subscription functionality
+;; SubscriptionNexus - Dynamic Service Payment Streams Contract v2.0
+;; Enables flexible subscription payments with real-time billing adjustments
 
 (define-constant SERVICE_ADMIN tx-sender)
 (define-constant ERR_PERMISSION_DENIED (err u400))
@@ -7,8 +7,10 @@
 (define-constant ERR_INSUFFICIENT_CREDIT (err u402))
 (define-constant ERR_SUBSCRIPTION_EXISTS (err u403))
 (define-constant ERR_INVALID_BILLING (err u404))
+(define-constant ERR_SERVICE_TERMINATED (err u405))
+(define-constant ERR_BILLING_SUSPENDED (err u406))
 
-;; Basic subscription data structure
+;; Subscription service data structure
 (define-map service-subscriptions
   { subscription-id: uint }
   {
@@ -16,9 +18,12 @@
     subscriber: principal,
     billing-rate: uint,          ;; Cost per second of service usage
     service-activation: uint,    ;; When subscription became active
+    billing-cycle-end: (optional uint), ;; Optional subscription end date
     total-prepaid: uint,         ;; Total amount prepaid for service
     charges-processed: uint,     ;; Amount already charged to subscriber
-    service-active: bool         ;; Service availability status
+    service-active: bool,        ;; Service availability status
+    billing-suspended: bool,     ;; Billing suspension status
+    suspension-time: (optional uint) ;; When billing was suspended
   }
 )
 
@@ -30,6 +35,23 @@
 
 ;; Track subscription counter
 (define-data-var subscription-counter uint u0)
+
+;; Track subscription statistics per user
+(define-map user-subscription-metrics
+  { user: principal }
+  { provided-services: uint, active-subscriptions: uint }
+)
+
+;; Map users to their subscription IDs
+(define-map provider-service-catalog
+  { provider: principal, service-index: uint }
+  { subscription-id: uint }
+)
+
+(define-map subscriber-service-list
+  { subscriber: principal, subscription-index: uint }
+  { subscription-id: uint }
+)
 
 ;; Get current time reference
 (define-read-only (get-time-reference)
@@ -53,14 +75,21 @@
     (let (
       (current-time (get-time-reference))
       (activation-time (get service-activation subscription-data))
+      (cycle-end (get billing-cycle-end subscription-data))
       (rate (get billing-rate subscription-data))
       (processed (get charges-processed subscription-data))
       (prepaid (get total-prepaid subscription-data))
       (active (get service-active subscription-data))
+      (suspended (get billing-suspended subscription-data))
+      (suspension-time (get suspension-time subscription-data))
     )
-    (if active
+    (if (and active (not suspended))
       (let (
-        (usage-duration (if (>= current-time activation-time) (- current-time activation-time) u0))
+        (effective-end (match cycle-end
+          some-end some-end
+          current-time))
+        (actual-end (if (> effective-end current-time) current-time effective-end))
+        (usage-duration (if (>= actual-end activation-time) (- actual-end activation-time) u0))
         (total-charges (* usage-duration rate))
         (outstanding (if (> total-charges processed) (- total-charges processed) u0))
         (max-billable (if (> prepaid processed) (- prepaid processed) u0))
@@ -102,11 +131,19 @@
 (define-public (activate-subscription 
   (subscriber principal) 
   (billing-rate uint) 
-  (prepaid-amount uint))
+  (prepaid-amount uint)
+  (cycle-duration (optional uint)))
   (let (
     (subscription-id (+ (var-get subscription-counter) u1))
     (provider-credits (get-credit-balance tx-sender))
     (current-time (get-time-reference))
+    (cycle-end (match cycle-duration
+      some-duration (some (+ current-time some-duration))
+      none))
+    (provider-metrics (default-to { provided-services: u0, active-subscriptions: u0 } 
+                   (map-get? user-subscription-metrics { user: tx-sender })))
+    (subscriber-metrics (default-to { provided-services: u0, active-subscriptions: u0 } 
+                      (map-get? user-subscription-metrics { user: subscriber })))
   )
   (asserts! (> billing-rate u0) ERR_INVALID_BILLING)
   (asserts! (> prepaid-amount u0) ERR_INVALID_BILLING)
@@ -127,14 +164,41 @@
       subscriber: subscriber,
       billing-rate: billing-rate,
       service-activation: current-time,
+      billing-cycle-end: cycle-end,
       total-prepaid: prepaid-amount,
       charges-processed: u0,
-      service-active: true
+      service-active: true,
+      billing-suspended: false,
+      suspension-time: none
     }
   )
   
   ;; Update subscription counter
   (var-set subscription-counter subscription-id)
+  
+  ;; Update user subscription mappings
+  (map-set provider-service-catalog
+    { provider: tx-sender, service-index: (get provided-services provider-metrics) }
+    { subscription-id: subscription-id }
+  )
+  
+  (map-set subscriber-service-list
+    { subscriber: subscriber, subscription-index: (get active-subscriptions subscriber-metrics) }
+    { subscription-id: subscription-id }
+  )
+  
+  ;; Update subscription metrics
+  (map-set user-subscription-metrics
+    { user: tx-sender }
+    { provided-services: (+ (get provided-services provider-metrics) u1), 
+      active-subscriptions: (get active-subscriptions provider-metrics) }
+  )
+  
+  (map-set user-subscription-metrics
+    { user: subscriber }
+    { provided-services: (get provided-services subscriber-metrics), 
+      active-subscriptions: (+ (get active-subscriptions subscriber-metrics) u1) }
+  )
   
   (ok subscription-id)))
 
@@ -149,7 +213,7 @@
       (provider-credits (get-credit-balance provider))
     )
     (asserts! (is-eq tx-sender provider) ERR_PERMISSION_DENIED)
-    (asserts! (get service-active subscription-data) ERR_INVALID_BILLING)
+    (asserts! (get service-active subscription-data) ERR_SERVICE_TERMINATED)
     (asserts! (> outstanding-amount u0) ERR_INSUFFICIENT_CREDIT)
     
     ;; Update subscription processed charges
@@ -165,6 +229,68 @@
     )
     
     (ok outstanding-amount))
+    ERR_SUBSCRIPTION_NOT_FOUND)
+)
+
+;; Suspend billing (provider only)
+(define-public (suspend-billing (subscription-id uint))
+  (match (map-get? service-subscriptions { subscription-id: subscription-id })
+    subscription-data
+    (let (
+      (provider (get provider subscription-data))
+      (current-time (get-time-reference))
+    )
+    (asserts! (is-eq tx-sender provider) ERR_PERMISSION_DENIED)
+    (asserts! (get service-active subscription-data) ERR_SERVICE_TERMINATED)
+    (asserts! (not (get billing-suspended subscription-data)) ERR_BILLING_SUSPENDED)
+    
+    (map-set service-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { 
+        billing-suspended: true,
+        suspension-time: (some current-time)
+      })
+    )
+    
+    (ok true))
+    ERR_SUBSCRIPTION_NOT_FOUND)
+)
+
+;; Resume billing (provider only)
+(define-public (resume-billing (subscription-id uint))
+  (match (map-get? service-subscriptions { subscription-id: subscription-id })
+    subscription-data
+    (let (
+      (provider (get provider subscription-data))
+      (current-time (get-time-reference))
+      (suspension-time (get suspension-time subscription-data))
+    )
+    (asserts! (is-eq tx-sender provider) ERR_PERMISSION_DENIED)
+    (asserts! (get service-active subscription-data) ERR_SERVICE_TERMINATED)
+    (asserts! (get billing-suspended subscription-data) ERR_BILLING_SUSPENDED)
+    
+    ;; Adjust activation time for suspended period
+    (let (
+      (suspended-duration (match suspension-time
+        some-suspension-time (- current-time some-suspension-time)
+        u0))
+      (new-activation-time (+ (get service-activation subscription-data) suspended-duration))
+      (new-cycle-end (match (get billing-cycle-end subscription-data)
+        some-end (some (+ some-end suspended-duration))
+        none))
+    )
+    
+    (map-set service-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { 
+        billing-suspended: false,
+        suspension-time: none,
+        service-activation: new-activation-time,
+        billing-cycle-end: new-cycle-end
+      })
+    )
+    
+    (ok true)))
     ERR_SUBSCRIPTION_NOT_FOUND)
 )
 
@@ -184,7 +310,7 @@
       (subscriber-credits (get-credit-balance (get subscriber subscription-data)))
     )
     (asserts! (is-eq tx-sender provider) ERR_PERMISSION_DENIED)
-    (asserts! (get service-active subscription-data) ERR_INVALID_BILLING)
+    (asserts! (get service-active subscription-data) ERR_SERVICE_TERMINATED)
     
     ;; Mark subscription as terminated
     (map-set service-subscriptions
@@ -217,7 +343,70 @@
     ERR_SUBSCRIPTION_NOT_FOUND)
 )
 
+;; Extend subscription with additional prepayment
+(define-public (extend-subscription (subscription-id uint) (additional-prepayment uint))
+  (match (map-get? service-subscriptions { subscription-id: subscription-id })
+    subscription-data
+    (let (
+      (provider (get provider subscription-data))
+      (provider-credits (get-credit-balance provider))
+      (current-prepaid (get total-prepaid subscription-data))
+    )
+    (asserts! (is-eq tx-sender provider) ERR_PERMISSION_DENIED)
+    (asserts! (get service-active subscription-data) ERR_SERVICE_TERMINATED)
+    (asserts! (>= provider-credits additional-prepayment) ERR_INSUFFICIENT_CREDIT)
+    (asserts! (> additional-prepayment u0) ERR_INVALID_BILLING)
+    
+    ;; Deduct from provider credits
+    (map-set account-credits
+      { account-holder: provider }
+      { credit-balance: (- provider-credits additional-prepayment) }
+    )
+    
+    ;; Update subscription prepayment
+    (map-set service-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { total-prepaid: (+ current-prepaid additional-prepayment) })
+    )
+    
+    (ok (+ current-prepaid additional-prepayment)))
+    ERR_SUBSCRIPTION_NOT_FOUND)
+)
+
+;; Get user subscription metrics
+(define-read-only (get-user-metrics (user principal))
+  (default-to { provided-services: u0, active-subscriptions: u0 }
+    (map-get? user-subscription-metrics { user: user }))
+)
+
+;; Get subscription ID by provider and index
+(define-read-only (get-provider-service (provider principal) (index uint))
+  (map-get? provider-service-catalog { provider: provider, service-index: index })
+)
+
+;; Get subscription ID by subscriber and index
+(define-read-only (get-subscriber-service (subscriber principal) (index uint))
+  (map-get? subscriber-service-list { subscriber: subscriber, subscription-index: index })
+)
+
 ;; Get total subscription count
 (define-read-only (get-total-subscriptions)
   (var-get subscription-counter)
+)
+
+;; Check if subscription cycle has ended
+(define-read-only (has-cycle-ended (subscription-id uint))
+  (match (map-get? service-subscriptions { subscription-id: subscription-id })
+    subscription-data
+    (let (
+      (current-time (get-time-reference))
+      (cycle-end (get billing-cycle-end subscription-data))
+    )
+    (or 
+      (not (get service-active subscription-data))
+      (match cycle-end
+        some-end (>= current-time some-end)
+        false)
+      (>= (get charges-processed subscription-data) (get total-prepaid subscription-data))))
+    false)
 )
