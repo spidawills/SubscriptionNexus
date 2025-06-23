@@ -1,0 +1,223 @@
+;; SubscriptionNexus - Basic Service Payment Streams Contract v1.0
+;; Initial implementation with core subscription functionality
+
+(define-constant SERVICE_ADMIN tx-sender)
+(define-constant ERR_PERMISSION_DENIED (err u400))
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u401))
+(define-constant ERR_INSUFFICIENT_CREDIT (err u402))
+(define-constant ERR_SUBSCRIPTION_EXISTS (err u403))
+(define-constant ERR_INVALID_BILLING (err u404))
+
+;; Basic subscription data structure
+(define-map service-subscriptions
+  { subscription-id: uint }
+  {
+    provider: principal,
+    subscriber: principal,
+    billing-rate: uint,          ;; Cost per second of service usage
+    service-activation: uint,    ;; When subscription became active
+    total-prepaid: uint,         ;; Total amount prepaid for service
+    charges-processed: uint,     ;; Amount already charged to subscriber
+    service-active: bool         ;; Service availability status
+  }
+)
+
+;; Track account credits for users
+(define-map account-credits
+  { account-holder: principal }
+  { credit-balance: uint }
+)
+
+;; Track subscription counter
+(define-data-var subscription-counter uint u0)
+
+;; Get current time reference
+(define-read-only (get-time-reference)
+  block-height
+)
+
+;; Get account credit balance
+(define-read-only (get-credit-balance (account-holder principal))
+  (default-to u0 (get credit-balance (map-get? account-credits { account-holder: account-holder })))
+)
+
+;; Get subscription information
+(define-read-only (get-subscription-info (subscription-id uint))
+  (map-get? service-subscriptions { subscription-id: subscription-id })
+)
+
+;; Calculate outstanding charges for billing
+(define-read-only (calculate-outstanding-charges (subscription-id uint))
+  (match (map-get? service-subscriptions { subscription-id: subscription-id })
+    subscription-data
+    (let (
+      (current-time (get-time-reference))
+      (activation-time (get service-activation subscription-data))
+      (rate (get billing-rate subscription-data))
+      (processed (get charges-processed subscription-data))
+      (prepaid (get total-prepaid subscription-data))
+      (active (get service-active subscription-data))
+    )
+    (if active
+      (let (
+        (usage-duration (if (>= current-time activation-time) (- current-time activation-time) u0))
+        (total-charges (* usage-duration rate))
+        (outstanding (if (> total-charges processed) (- total-charges processed) u0))
+        (max-billable (if (> prepaid processed) (- prepaid processed) u0))
+      )
+      (if (< outstanding max-billable) outstanding max-billable))
+      u0))
+    u0)
+)
+
+;; Add credits to account
+(define-public (add-credits (amount uint))
+  (let (
+    (current-credits (get-credit-balance tx-sender))
+    (new-balance (+ current-credits amount))
+  )
+  (map-set account-credits
+    { account-holder: tx-sender }
+    { credit-balance: new-balance }
+  )
+  (ok new-balance))
+)
+
+;; Withdraw credits from account
+(define-public (withdraw-credits (amount uint))
+  (let (
+    (current-credits (get-credit-balance tx-sender))
+  )
+  (if (>= current-credits amount)
+    (begin
+      (map-set account-credits
+        { account-holder: tx-sender }
+        { credit-balance: (- current-credits amount) }
+      )
+      (ok (- current-credits amount)))
+    ERR_INSUFFICIENT_CREDIT))
+)
+
+;; Activate new service subscription
+(define-public (activate-subscription 
+  (subscriber principal) 
+  (billing-rate uint) 
+  (prepaid-amount uint))
+  (let (
+    (subscription-id (+ (var-get subscription-counter) u1))
+    (provider-credits (get-credit-balance tx-sender))
+    (current-time (get-time-reference))
+  )
+  (asserts! (> billing-rate u0) ERR_INVALID_BILLING)
+  (asserts! (> prepaid-amount u0) ERR_INVALID_BILLING)
+  (asserts! (>= provider-credits prepaid-amount) ERR_INSUFFICIENT_CREDIT)
+  (asserts! (is-none (map-get? service-subscriptions { subscription-id: subscription-id })) ERR_SUBSCRIPTION_EXISTS)
+  
+  ;; Process prepayment from provider credits
+  (map-set account-credits
+    { account-holder: tx-sender }
+    { credit-balance: (- provider-credits prepaid-amount) }
+  )
+  
+  ;; Create subscription record
+  (map-set service-subscriptions
+    { subscription-id: subscription-id }
+    {
+      provider: tx-sender,
+      subscriber: subscriber,
+      billing-rate: billing-rate,
+      service-activation: current-time,
+      total-prepaid: prepaid-amount,
+      charges-processed: u0,
+      service-active: true
+    }
+  )
+  
+  ;; Update subscription counter
+  (var-set subscription-counter subscription-id)
+  
+  (ok subscription-id)))
+
+;; Process billing for service usage
+(define-public (process-billing (subscription-id uint))
+  (match (map-get? service-subscriptions { subscription-id: subscription-id })
+    subscription-data
+    (let (
+      (provider (get provider subscription-data))
+      (outstanding-amount (calculate-outstanding-charges subscription-id))
+      (current-processed (get charges-processed subscription-data))
+      (provider-credits (get-credit-balance provider))
+    )
+    (asserts! (is-eq tx-sender provider) ERR_PERMISSION_DENIED)
+    (asserts! (get service-active subscription-data) ERR_INVALID_BILLING)
+    (asserts! (> outstanding-amount u0) ERR_INSUFFICIENT_CREDIT)
+    
+    ;; Update subscription processed charges
+    (map-set service-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { charges-processed: (+ current-processed outstanding-amount) })
+    )
+    
+    ;; Add billing amount to provider credits
+    (map-set account-credits
+      { account-holder: provider }
+      { credit-balance: (+ provider-credits outstanding-amount) }
+    )
+    
+    (ok outstanding-amount))
+    ERR_SUBSCRIPTION_NOT_FOUND)
+)
+
+;; Terminate subscription and settle accounts
+(define-public (terminate-subscription (subscription-id uint))
+  (match (map-get? service-subscriptions { subscription-id: subscription-id })
+    subscription-data
+    (let (
+      (provider (get provider subscription-data))
+      (outstanding-for-provider (calculate-outstanding-charges subscription-id))
+      (total-prepaid (get total-prepaid subscription-data))
+      (processed (get charges-processed subscription-data))
+      (refund-amount (if (> (- total-prepaid processed) outstanding-for-provider)
+                       (- (- total-prepaid processed) outstanding-for-provider)
+                       u0))
+      (provider-credits (get-credit-balance provider))
+      (subscriber-credits (get-credit-balance (get subscriber subscription-data)))
+    )
+    (asserts! (is-eq tx-sender provider) ERR_PERMISSION_DENIED)
+    (asserts! (get service-active subscription-data) ERR_INVALID_BILLING)
+    
+    ;; Mark subscription as terminated
+    (map-set service-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { service-active: false })
+    )
+    
+    ;; Refund unused prepayment to subscriber
+    (if (> refund-amount u0)
+      (map-set account-credits
+        { account-holder: (get subscriber subscription-data) }
+        { credit-balance: (+ subscriber-credits refund-amount) })
+      true)
+    
+    ;; Give outstanding charges to provider
+    (if (> outstanding-for-provider u0)
+      (begin
+        (map-set account-credits
+          { account-holder: provider }
+          { credit-balance: (+ provider-credits outstanding-for-provider) })
+        (map-set service-subscriptions
+          { subscription-id: subscription-id }
+          (merge subscription-data { 
+            charges-processed: (+ processed outstanding-for-provider),
+            service-active: false 
+          })))
+      true)
+    
+    (ok { refunded: refund-amount, final-billing: outstanding-for-provider }))
+    ERR_SUBSCRIPTION_NOT_FOUND)
+)
+
+;; Get total subscription count
+(define-read-only (get-total-subscriptions)
+  (var-get subscription-counter)
+)
